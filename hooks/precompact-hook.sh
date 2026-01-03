@@ -1,13 +1,12 @@
 #!/bin/bash
 
-# Ralph Wiggum Pre-Compact Hook
-# Preserves goals and critical context before /compact is run
-# This ensures the original objective survives context reduction
+# Ralph Wiggum Pre-Compact Hook (Memorai Edition)
+# Preserves session ID for context restoration after /compact
+# Session memory persists in memorai - no need to copy data
 
 set -euo pipefail
 
 RALPH_STATE_FILE=".claude/ralph-loop.local.md"
-RALPH_MEMORY_FILE=".claude/RALPH_MEMORY.md"
 COMPACT_PRESERVE_FILE=".claude/RALPH_COMPACT_PRESERVE.md"
 
 # Only act if ralph-loop is active
@@ -15,42 +14,34 @@ if [[ ! -f "$RALPH_STATE_FILE" ]]; then
   exit 0
 fi
 
-# Check if memory file exists
-if [[ ! -f "$RALPH_MEMORY_FILE" ]]; then
-  exit 0
-fi
+# Parse session_id from state file
+parse_frontmatter() {
+  sed -n '/^---$/,/^---$/{ /^---$/d; p; }' "$1"
+}
 
-# Extract critical sections from memory to preserve
+get_yaml_value() {
+  echo "$1" | grep "^$2:" | sed "s/$2: *//" | sed 's/^"\(.*\)"$/\1/'
+}
+
+FRONTMATTER=$(parse_frontmatter "$RALPH_STATE_FILE")
+SESSION_ID=$(get_yaml_value "$FRONTMATTER" "session_id")
+ITERATION=$(get_yaml_value "$FRONTMATTER" "iteration")
+
+# Create minimal preserve file with session ID
 {
   echo "# Ralph Context (Preserved for Compaction)"
   echo ""
-  echo "_This file was auto-generated before /compact to preserve critical context._"
+  echo "_This file was auto-generated before /compact to preserve session reference._"
   echo ""
-
-  # Extract Original Objective
-  echo "## Original Objective"
-  sed -n '/^## Original Objective$/,/^## /{ /^## Original Objective$/d; /^## /d; p; }' "$RALPH_MEMORY_FILE"
+  echo "**Session ID:** $SESSION_ID"
+  echo "**Iteration:** $ITERATION"
   echo ""
-
-  # Extract Current Status
-  echo "## Current Status"
-  sed -n '/^## Current Status$/,/^## /{ /^## Current Status$/d; /^## /d; p; }' "$RALPH_MEMORY_FILE"
+  echo "Session memory is stored in Memorai and will be restored automatically."
   echo ""
-
-  # Extract Next Actions
-  echo "## Next Actions"
-  sed -n '/^## Next Actions$/,/^## /{ /^## Next Actions$/d; /^## /d; p; }' "$RALPH_MEMORY_FILE"
-  echo ""
-
-  # Extract Key Learnings (important to avoid repeating mistakes)
-  echo "## Key Learnings"
-  sed -n '/^## Key Learnings$/,/^## /{ /^## Key Learnings$/d; /^## /d; p; }' "$RALPH_MEMORY_FILE"
-  echo ""
-
   echo "---"
-  echo "_After compact, refer to .claude/RALPH_MEMORY.md for full history._"
+  echo "_After compact, context will be restored from memorai._"
 } > "$COMPACT_PRESERVE_FILE"
 
-echo "📋 Ralph: Preserved context for compaction in $COMPACT_PRESERVE_FILE"
+echo "📋 Ralph: Preserved session ID for compaction (memorai data persists)"
 
 exit 0

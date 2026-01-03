@@ -7,105 +7,248 @@
  * context is provided to maintain focus across iterations.
  *
  * Usage: echo '<input_json>' | bun run build-context.ts
- * Input: JSON with state, memory, strategy, analysis
+ * Input: JSON with state, strategy, analysis, and session_id
  * Output: Formatted context string for the next iteration
+ *
+ * Memorai Integration:
+ * - Queries memorai for session state (objective, status, learnings)
+ * - Queries memorai for past session learnings relevant to the current objective
+ * - No longer reads from RALPH_MEMORY.md
  */
 
-import { existsSync, readFileSync } from "fs";
 import type {
   RalphState,
   RalphMemory,
   StrategyResult,
   TranscriptAnalysis,
 } from "./types";
+import { MemoraiClient, search, getMemoryById, databaseExists, type SearchResult } from "memorai";
 
 interface ContextInput {
-  state: RalphState;
-  memory?: RalphMemory;
-  memory_path?: string;
+  state: RalphState & { session_id?: string };
+  memory?: RalphMemory; // Optional - if not provided, queries memorai
   strategy: StrategyResult;
   analysis?: TranscriptAnalysis;
   nudge_content?: string;
+  // Memorai configuration
+  use_memorai?: boolean; // Enable/disable memorai queries (default: true)
+  memorai_limit?: number; // Max memories to retrieve (default: 5)
+}
+
+interface PastLearning {
+  title: string;
+  summary: string;
+  category: string;
+  relevance: number;
+}
+
+interface SessionState {
+  iteration: number;
+  current_status: string;
+  next_actions: string[];
+  started_at: string;
+  last_updated: string;
 }
 
 const DIVIDER = "═".repeat(50);
 const SECTION_DIVIDER = "─".repeat(40);
 
-function loadMemory(path: string): RalphMemory | null {
-  if (!existsSync(path)) {
+const SESSION_OBJECTIVE_TAG = "ralph-session-objective";
+const SESSION_STATE_TAG = "ralph-session-state";
+
+/**
+ * Query the session objective from memorai
+ */
+function querySessionObjective(client: MemoraiClient, sessionId: string): string | null {
+  try {
+    const results = client.search({
+      query: sessionId,
+      tags: ["ralph", SESSION_OBJECTIVE_TAG],
+      limit: 1,
+    });
+
+    if (results.length > 0) {
+      const memory = client.get(results[0].id, { full: true });
+      if (memory && "content" in memory) {
+        return memory.content;
+      }
+    }
+    return null;
+  } catch {
     return null;
   }
+}
 
+/**
+ * Query the current session state from memorai
+ */
+function querySessionState(client: MemoraiClient, sessionId: string): SessionState | null {
   try {
-    const content = readFileSync(path, "utf-8");
+    const results = client.search({
+      query: sessionId,
+      tags: ["ralph", SESSION_STATE_TAG],
+      limit: 1,
+    });
 
-    // Parse YAML frontmatter
-    const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
-    if (!frontmatterMatch) return null;
-
-    const body = content.slice(frontmatterMatch[0].length).trim();
-
-    // Extract sections
-    const sections: Record<string, string> = {};
-    const sectionRegex = /^## (.+)$/gm;
-    let lastSection = "";
-    let lastIndex = 0;
-    let match;
-
-    while ((match = sectionRegex.exec(body)) !== null) {
-      if (lastSection) {
-        sections[lastSection] = body.slice(lastIndex, match.index).trim();
+    if (results.length > 0) {
+      const memory = client.get(results[0].id, { full: true });
+      if (memory && "content" in memory) {
+        return JSON.parse(memory.content);
       }
-      lastSection = match[1];
-      lastIndex = match.index + match[0].length;
     }
-    if (lastSection) {
-      sections[lastSection] = body.slice(lastIndex).trim();
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Query learnings for this session
+ */
+function querySessionLearnings(client: MemoraiClient, sessionId: string): string[] {
+  try {
+    const results = client.search({
+      query: sessionId,
+      tags: ["ralph", "learning"],
+      limit: 10,
+    });
+
+    return results
+      .filter(r => r.title.startsWith("Ralph Learning:"))
+      .map(r => r.title.replace("Ralph Learning: ", "").trim());
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Load memory from memorai, reconstructing RalphMemory structure
+ */
+function loadMemoryFromMemorai(
+  client: MemoraiClient,
+  sessionId: string
+): RalphMemory | null {
+  try {
+    const objective = querySessionObjective(client, sessionId);
+    const state = querySessionState(client, sessionId);
+    const learnings = querySessionLearnings(client, sessionId);
+
+    if (!objective && !state) {
+      return null;
     }
 
     return {
-      session_id: "",
-      started_at: "",
-      last_updated: "",
-      current_iteration: 0,
-      original_objective: sections["Original Objective"] || "",
-      current_status: sections["Current Status"] || "",
-      accomplished: [],
-      failed_attempts: [],
-      next_actions: parseNumberedList(sections["Next Actions"]),
-      key_learnings: parseList(sections["Key Learnings"]),
+      session_id: sessionId,
+      started_at: state?.started_at || new Date().toISOString(),
+      last_updated: state?.last_updated || new Date().toISOString(),
+      current_iteration: state?.iteration || 0,
+      original_objective: objective || "",
+      current_status: state?.current_status || "",
+      accomplished: [], // Not needed for context building
+      failed_attempts: [], // Not needed for context building
+      next_actions: state?.next_actions || [],
+      key_learnings: learnings,
     };
   } catch {
     return null;
   }
 }
 
-function parseList(text: string | undefined): string[] {
-  if (!text) return [];
-  return text
-    .split("\n")
-    .filter((line) => line.startsWith("- "))
-    .map((line) => line.slice(2).trim())
-    .filter((item) => item && !item.startsWith("_"));
-}
+/**
+ * Query memorai for past session learnings relevant to the current objective.
+ * Returns empty array if memorai is not available or no relevant memories found.
+ *
+ * Searches across all categories but prioritizes:
+ * - decisions (what worked before)
+ * - architecture (system design knowledge)
+ * - reports (error patterns, analysis)
+ * - summaries (session outcomes)
+ */
+function queryPastLearnings(
+  client: MemoraiClient,
+  objective: string,
+  currentSessionId: string,
+  limit: number = 5
+): PastLearning[] {
+  try {
+    // Extract key words from objective (remove common words)
+    const stopWords = new Set([
+      "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+      "of", "with", "by", "from", "as", "is", "was", "are", "were", "been",
+      "be", "have", "has", "had", "do", "does", "did", "will", "would", "could",
+      "should", "may", "might", "must", "shall", "can", "need", "make", "build",
+      "create", "implement", "add", "use", "using", "that", "this", "it"
+    ]);
 
-function parseNumberedList(text: string | undefined): string[] {
-  if (!text) return [];
-  return text
-    .split("\n")
-    .filter((line) => /^\d+\.\s/.test(line))
-    .map((line) => line.replace(/^\d+\.\s*/, "").trim())
-    .filter((item) => item && !item.startsWith("_"));
+    const words = objective
+      .toLowerCase()
+      .replace(/[^\w\s]/g, " ")
+      .split(/\s+/)
+      .filter((w) => w.length > 2 && !stopWords.has(w))
+      .slice(0, 5); // Take top 5 meaningful words
+
+    if (words.length === 0) {
+      return [];
+    }
+
+    // Use OR-style search by joining key words
+    const query = words.join(" OR ");
+
+    // Search across all categories with importance threshold
+    const results = client.search({
+      query,
+      limit: limit + 5, // Get a few extra to filter
+      importanceMin: 5,
+    });
+
+    // Also search specifically for ralph-tagged entries if any exist
+    const ralphResults = client.search({
+      query,
+      tags: ["ralph"],
+      limit: 3,
+    });
+
+    // Combine and deduplicate, excluding current session
+    const combined = [...results, ...ralphResults];
+    const seen = new Set<string>();
+    const unique = combined.filter((r) => {
+      if (seen.has(r.id)) return false;
+      // Exclude entries from current session (we already have those)
+      if (r.tags?.includes(currentSessionId)) return false;
+      seen.add(r.id);
+      return true;
+    });
+
+    // Sort by relevance and take top N
+    unique.sort((a, b) => b.relevance - a.relevance);
+
+    // Filter out low relevance results (< 20% relevance)
+    const relevant = unique.filter((r) => r.relevance >= 20);
+
+    return relevant.slice(0, limit).map((r) => ({
+      title: r.title,
+      summary: r.summary || "(no summary)",
+      category: r.category,
+      relevance: r.relevance,
+    }));
+  } catch {
+    // Silently fail - memorai integration is optional
+    return [];
+  }
 }
 
 function buildContext(input: ContextInput): string {
   const { state, strategy } = input;
   const lines: string[] = [];
 
-  // Load memory if path provided but not object
+  // Determine session ID
+  const sessionId = state.session_id || "";
+
+  // Load memory from memorai if not provided and session ID exists
   let memory = input.memory;
-  if (!memory && input.memory_path) {
-    memory = loadMemory(input.memory_path);
+  if (!memory && sessionId && databaseExists()) {
+    const client = new MemoraiClient();
+    memory = loadMemoryFromMemorai(client, sessionId);
   }
 
   // Header with iteration
@@ -175,6 +318,37 @@ function buildContext(input: ContextInput): string {
     lines.push("");
   }
 
+  // Memorai Integration: Past session learnings
+  const useMemorAI = input.use_memorai !== false && databaseExists();
+  if (useMemorAI) {
+    try {
+      const client = new MemoraiClient();
+      const objective = memory?.original_objective || state.prompt_text || "";
+      const pastLearnings = queryPastLearnings(
+        client,
+        objective,
+        sessionId,
+        input.memorai_limit ?? 5
+      );
+
+      if (pastLearnings.length > 0) {
+        lines.push("## FROM PAST SESSIONS");
+        lines.push("");
+        lines.push("_Relevant knowledge from previous Ralph sessions:_");
+        lines.push("");
+        for (const learning of pastLearnings) {
+          lines.push(`- **[${learning.category}]** ${learning.title}`);
+          if (learning.summary && learning.summary !== "(no summary)") {
+            lines.push(`  > ${learning.summary}`);
+          }
+        }
+        lines.push("");
+      }
+    } catch {
+      // Silently fail
+    }
+  }
+
   // Error context (if recent errors)
   if (input.analysis?.errors && input.analysis.errors.length > 0) {
     lines.push("## RECENT ERRORS (fix these!)");
@@ -219,7 +393,7 @@ async function main() {
   if (!inputText) {
     console.error("Usage: echo '<input_json>' | bun run build-context.ts");
     console.error(
-      "Input: JSON with state, strategy, and optionally memory/memory_path"
+      "Input: JSON with state, strategy, and optionally session_id"
     );
     process.exit(1);
   }

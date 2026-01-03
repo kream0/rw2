@@ -1,13 +1,24 @@
 #!/bin/bash
 
-# Ralph Loop Setup Script (Enhanced)
-# Creates state file and initializes memory for in-session Ralph loop
+# Ralph Loop Setup Script (Enhanced - Memorai)
+# Creates state file and initializes session in memorai
+# No longer creates RALPH_MEMORY.md - all data in memorai
 
 set -euo pipefail
 
 # Get script directory for accessing TS scripts
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# Check if memorai is available (run from SCRIPT_DIR where package.json is)
+if ! (cd "$SCRIPT_DIR" && bun -e "import { databaseExists } from 'memorai'; console.log(databaseExists() ? 'ok' : 'no')" 2>/dev/null) | grep -q "ok"; then
+  echo "❌ Error: Memorai database not found." >&2
+  echo "" >&2
+  echo "   Ralph requires Memorai for session memory persistence." >&2
+  echo "   Run: memorai init" >&2
+  echo "" >&2
+  exit 1
+fi
 
 # Parse arguments
 PROMPT_PARTS=()
@@ -21,7 +32,7 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     -h|--help)
       cat << 'HELP_EOF'
-Ralph Loop - Interactive self-referential development loop (Enhanced)
+Ralph Loop - Interactive self-referential development loop (Memorai Edition)
 
 USAGE:
   /ralph-loop [PROMPT...] [OPTIONS]
@@ -40,8 +51,8 @@ DESCRIPTION:
   Starts a Ralph Wiggum loop in your CURRENT session. The stop hook prevents
   exit and feeds your output back as input until completion or iteration limit.
 
-  NEW in v2: Context management via RALPH_MEMORY.md, adaptive strategies,
-  and status dashboard at RALPH_STATUS.md.
+  Session memory is stored in Memorai for cross-session learning and recall.
+  Use /ralph-recall to query past sessions.
 
   To signal completion, you must output: <promise>YOUR_PHRASE</promise>
 
@@ -59,8 +70,8 @@ MONITORING:
   # View current status dashboard:
   cat .claude/RALPH_STATUS.md
 
-  # View session memory:
-  cat .claude/RALPH_MEMORY.md
+  # Query past sessions (requires memorai):
+  /ralph-recall <search terms>
 
   # View current iteration:
   grep '^iteration:' .claude/ralph-loop.local.md
@@ -156,7 +167,10 @@ fi
 
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-# Create enhanced state file with new fields
+# Generate session ID
+SESSION_ID="ralph-$(date +%Y%m%d%H%M%S)-$(head -c 4 /dev/urandom | xxd -p)"
+
+# Create enhanced state file with session_id
 cat > .claude/ralph-loop.local.md <<EOF
 ---
 active: true
@@ -164,6 +178,7 @@ iteration: 1
 max_iterations: $MAX_ITERATIONS
 completion_promise: $COMPLETION_PROMISE_YAML
 started_at: "$STARTED_AT"
+session_id: "$SESSION_ID"
 checkpoint_interval: $CHECKPOINT_INTERVAL
 checkpoint_mode: "$CHECKPOINT_MODE"
 strategy:
@@ -179,46 +194,12 @@ phases: []
 $PROMPT
 EOF
 
-# Generate session ID
-SESSION_ID="ralph-$(date +%Y%m%d%H%M%S)-$(head -c 4 /dev/urandom | xxd -p)"
-
-# Initialize RALPH_MEMORY.md
-cat > .claude/RALPH_MEMORY.md <<EOF
----
-session_id: "$SESSION_ID"
-started_at: "$STARTED_AT"
-last_updated: "$STARTED_AT"
----
-
-# Ralph Session Memory
-
-## Original Objective
-$PROMPT
-
-## Current Status
-Session started - beginning exploration phase
-
-## Accomplished
-_Nothing yet_
-
-## Failed Attempts
-_None yet_
-
-## Next Actions
-1. Understand the task requirements
-2. Explore the codebase for relevant files
-3. Begin implementation
-
-## Key Learnings
-_None yet_
-
-EOF
-
-# Initialize RALPH_STATUS.md
+# Initialize RALPH_STATUS.md (kept for human monitoring)
 cat > .claude/RALPH_STATUS.md <<EOF
 # Ralph Status 🔄
 
 _Last updated: $STARTED_AT
+_Session ID: $SESSION_ID
 
 ## Overview
 
@@ -243,12 +224,15 @@ $(if [[ $CHECKPOINT_INTERVAL -gt 0 ]]; then echo "| Next Checkpoint | Iteration 
 - \`/ralph-status\` - Refresh this view
 - \`/ralph-nudge <instruction>\` - Send guidance
 - \`/cancel-ralph\` - Stop the loop
+- \`/ralph-recall <query>\` - Query past sessions
+
+**Memory:** Stored in Memorai (cross-session learning enabled)
 
 EOF
 
 # Output setup message
 cat <<EOF
-🔄 Ralph loop activated! (Enhanced v2)
+🔄 Ralph loop activated! (Memorai Edition)
 
 Session ID: $SESSION_ID
 Iteration: 1
@@ -257,11 +241,11 @@ Completion promise: $(if [[ "$COMPLETION_PROMISE" != "null" ]]; then echo "${COM
 $(if [[ $CHECKPOINT_INTERVAL -gt 0 ]]; then echo "Checkpoint: Every $CHECKPOINT_INTERVAL iterations ($CHECKPOINT_MODE mode)"; fi)
 
 📊 Monitor: cat .claude/RALPH_STATUS.md
-📝 Memory:  cat .claude/RALPH_MEMORY.md
+🔍 Recall:  /ralph-recall <query>
 🛑 Cancel:  /cancel-ralph
 
-The stop hook is now active. Context will be managed across iterations
-with goal recitation and adaptive strategies.
+Session memory stored in Memorai for cross-session learning.
+Context will be managed across iterations with goal recitation.
 
 ⚠️  WARNING: This loop cannot be stopped manually unless you set
     --max-iterations or --completion-promise.

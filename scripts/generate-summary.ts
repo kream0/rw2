@@ -3,80 +3,127 @@
  * Ralph Wiggum - Post-Loop Summary Generator
  *
  * Generates a comprehensive summary when the loop ends.
- * Analyzes the full session to provide insights.
+ * Analyzes the full session data from memorai to provide insights.
  *
- * Usage: bun run generate-summary.ts [memory_path] [output_path]
- * Input: Optional state JSON via stdin
+ * Usage: bun run generate-summary.ts [output_path]
+ * Input: JSON via stdin with session_id, completion_reason, final_iteration
  * Output: RALPH_SUMMARY.md file
  */
 
-import { existsSync, readFileSync, writeFileSync } from "fs";
+import { writeFileSync } from "fs";
+import { MemoraiClient, search, getMemoryById, storeMemory, databaseExists } from "memorai";
 
 interface SummaryInput {
-  memory_path?: string;
-  status_path?: string;
-  state_path?: string;
+  session_id: string;
   completion_reason?: "promise" | "max_iterations" | "cancelled" | "error";
   final_iteration?: number;
+  original_objective?: string;
 }
 
-const DEFAULT_MEMORY_PATH = ".claude/RALPH_MEMORY.md";
+interface SessionState {
+  iteration: number;
+  current_status: string;
+  next_actions: string[];
+  started_at: string;
+  last_updated: string;
+}
+
+interface SessionData {
+  objective: string;
+  state: SessionState | null;
+  accomplishments: string[];
+  failures: string[];
+  learnings: string[];
+}
+
 const DEFAULT_OUTPUT_PATH = ".claude/RALPH_SUMMARY.md";
+const SESSION_OBJECTIVE_TAG = "ralph-session-objective";
+const SESSION_STATE_TAG = "ralph-session-state";
 
-function parseMemoryFile(path: string): Record<string, string> {
-  if (!existsSync(path)) {
-    return {};
-  }
+/**
+ * Load all session data from memorai
+ */
+function loadSessionFromMemorai(
+  client: MemoraiClient,
+  sessionId: string
+): SessionData {
+  const data: SessionData = {
+    objective: "",
+    state: null,
+    accomplishments: [],
+    failures: [],
+    learnings: [],
+  };
 
-  const content = readFileSync(path, "utf-8");
-  const sections: Record<string, string> = {};
-
-  // Skip frontmatter
-  const bodyMatch = content.match(/^---[\s\S]*?---\n([\s\S]*)$/);
-  const body = bodyMatch ? bodyMatch[1] : content;
-
-  // Parse sections
-  const sectionRegex = /^## (.+)$/gm;
-  let lastSection = "";
-  let lastIndex = 0;
-  let match;
-
-  while ((match = sectionRegex.exec(body)) !== null) {
-    if (lastSection) {
-      sections[lastSection] = body.slice(lastIndex, match.index).trim();
-    }
-    lastSection = match[1];
-    lastIndex = match.index + match[0].length;
-  }
-  if (lastSection) {
-    sections[lastSection] = body.slice(lastIndex).trim();
-  }
-
-  return sections;
-}
-
-function countListItems(text: string | undefined): number {
-  if (!text) return 0;
-  return text.split("\n").filter((line) => line.startsWith("- ")).length;
-}
-
-function extractAccomplishments(text: string | undefined): string[] {
-  if (!text) return [];
-  return text
-    .split("\n")
-    .filter((line) => line.startsWith("- "))
-    .map((line) => {
-      // Remove iteration prefix if present
-      return line.replace(/^- \[Iteration \d+\] /, "- ");
+  try {
+    // Get objective
+    const objectiveResults = client.search({
+      query: sessionId,
+      tags: ["ralph", SESSION_OBJECTIVE_TAG],
+      limit: 1,
     });
+    if (objectiveResults.length > 0) {
+      const memory = client.get(objectiveResults[0].id, { full: true });
+      if (memory && "content" in memory) {
+        data.objective = memory.content;
+      }
+    }
+
+    // Get state
+    const stateResults = client.search({
+      query: sessionId,
+      tags: ["ralph", SESSION_STATE_TAG],
+      limit: 1,
+    });
+    if (stateResults.length > 0) {
+      const memory = client.get(stateResults[0].id, { full: true });
+      if (memory && "content" in memory) {
+        data.state = JSON.parse(memory.content);
+      }
+    }
+
+    // Get accomplishments
+    const accomplishmentResults = client.search({
+      query: sessionId,
+      tags: ["ralph", "progress"],
+      limit: 20,
+    });
+    data.accomplishments = accomplishmentResults
+      .filter(r => r.title.startsWith("Ralph Progress:"))
+      .map(r => r.title.replace("Ralph Progress: ", "").trim());
+
+    // Get failures
+    const failureResults = client.search({
+      query: sessionId,
+      tags: ["ralph", "failure"],
+      limit: 20,
+    });
+    data.failures = failureResults
+      .filter(r => r.title.startsWith("Ralph Failed:"))
+      .map(r => r.title.replace("Ralph Failed: ", "").trim());
+
+    // Get learnings
+    const learningResults = client.search({
+      query: sessionId,
+      tags: ["ralph", "learning"],
+      limit: 20,
+    });
+    data.learnings = learningResults
+      .filter(r => r.title.startsWith("Ralph Learning:"))
+      .map(r => r.title.replace("Ralph Learning: ", "").trim());
+  } catch {
+    // Return partial data on error
+  }
+
+  return data;
 }
 
 function determineOutcome(
-  sections: Record<string, string>,
+  sessionData: SessionData,
   reason: string
 ): { emoji: string; label: string; description: string } {
-  const accomplishments = countListItems(sections["Accomplished"]);
-  const failures = countListItems(sections["Failed Attempts"]);
+  const accomplishments = sessionData.accomplishments.length;
+  const failures = sessionData.failures.length;
 
   if (reason === "promise") {
     return {
@@ -124,16 +171,93 @@ function determineOutcome(
   };
 }
 
-function generateSummary(input: SummaryInput): string {
-  const memoryPath = input.memory_path || DEFAULT_MEMORY_PATH;
-  const sections = parseMemoryFile(memoryPath);
+/**
+ * Store session summary to memorai for cross-session learning.
+ */
+function storeSummaryToMemorai(
+  client: MemoraiClient,
+  input: SummaryInput,
+  sessionData: SessionData,
+  outcome: { emoji: string; label: string; description: string }
+): void {
+  try {
+    const sessionId = input.session_id;
+    const objective = input.original_objective || sessionData.objective || "Unknown objective";
+
+    // Build summary content
+    const accomplishmentsText = sessionData.accomplishments.length > 0
+      ? sessionData.accomplishments.map(a => `- ${a}`).join("\n")
+      : "_None_";
+    const learningsText = sessionData.learnings.length > 0
+      ? sessionData.learnings.map(l => `- ${l}`).join("\n")
+      : "_None_";
+    const failuresText = sessionData.failures.length > 0
+      ? sessionData.failures.map(f => `- ${f}`).join("\n")
+      : "_None_";
+
+    const content = [
+      `# Ralph Session Complete: ${outcome.label}`,
+      "",
+      `**Outcome:** ${outcome.description}`,
+      `**Iterations:** ${input.final_iteration || "Unknown"}`,
+      "",
+      "## Original Objective",
+      objective,
+      "",
+      "## Accomplishments",
+      accomplishmentsText,
+      "",
+      "## Key Learnings",
+      learningsText,
+      "",
+      "## Failed Attempts",
+      failuresText,
+    ].join("\n");
+
+    // Determine importance based on outcome
+    let importance = 7;
+    if (outcome.label === "COMPLETED") {
+      importance = 9;
+    } else if (outcome.label === "ERROR" || outcome.label === "INCOMPLETE") {
+      importance = 8;
+    }
+
+    // Build tags based on outcome
+    const tags = [
+      "ralph",
+      "session-summary",
+      `outcome-${outcome.label.toLowerCase()}`,
+      sessionId,
+    ];
+
+    if (input.completion_reason) {
+      tags.push(`reason-${input.completion_reason}`);
+    }
+
+    client.store({
+      category: "summaries",
+      title: `Ralph Session: ${outcome.label} - ${objective.slice(0, 40)}...`,
+      content,
+      tags,
+      importance,
+      sessionId,
+    });
+  } catch {
+    // Silently fail
+  }
+}
+
+function generateSummary(
+  client: MemoraiClient,
+  input: SummaryInput
+): string {
+  const sessionData = loadSessionFromMemorai(client, input.session_id);
 
   const completionReason = input.completion_reason || "unknown";
-  const outcome = determineOutcome(sections, completionReason);
+  const outcome = determineOutcome(sessionData, completionReason);
 
-  const accomplishments = extractAccomplishments(sections["Accomplished"]);
-  const learnings = extractAccomplishments(sections["Key Learnings"]);
-  const failedCount = countListItems(sections["Failed Attempts"]);
+  // Store summary to memorai for cross-session learning
+  storeSummaryToMemorai(client, input, sessionData, outcome);
 
   const lines: string[] = [];
 
@@ -141,6 +265,7 @@ function generateSummary(input: SummaryInput): string {
   lines.push(`# Ralph Session Summary ${outcome.emoji}`);
   lines.push("");
   lines.push(`_Generated: ${new Date().toISOString()}_`);
+  lines.push(`_Session ID: ${input.session_id}_`);
   lines.push("");
 
   // Outcome box
@@ -154,29 +279,29 @@ function generateSummary(input: SummaryInput): string {
   lines.push("");
 
   // Original objective
-  if (sections["Original Objective"]) {
+  if (sessionData.objective || input.original_objective) {
     lines.push("## Original Objective");
     lines.push("");
-    lines.push(sections["Original Objective"]);
+    lines.push(sessionData.objective || input.original_objective || "");
     lines.push("");
   }
 
   // Final status
-  if (sections["Current Status"]) {
+  if (sessionData.state?.current_status) {
     lines.push("## Final Status");
     lines.push("");
-    lines.push(sections["Current Status"]);
+    lines.push(sessionData.state.current_status);
     lines.push("");
   }
 
   // Accomplishments
   lines.push("## Accomplishments");
   lines.push("");
-  if (accomplishments.length === 0) {
+  if (sessionData.accomplishments.length === 0) {
     lines.push("_No accomplishments recorded_");
   } else {
-    for (const item of accomplishments) {
-      lines.push(item);
+    for (const item of sessionData.accomplishments) {
+      lines.push(`- ${item}`);
     }
   }
   lines.push("");
@@ -187,17 +312,17 @@ function generateSummary(input: SummaryInput): string {
   lines.push("| Metric | Value |");
   lines.push("|--------|-------|");
   lines.push(`| Iterations | ${input.final_iteration || "Unknown"} |`);
-  lines.push(`| Accomplishments | ${accomplishments.length} |`);
-  lines.push(`| Failed Attempts | ${failedCount} |`);
-  lines.push(`| Learnings | ${learnings.length} |`);
+  lines.push(`| Accomplishments | ${sessionData.accomplishments.length} |`);
+  lines.push(`| Failed Attempts | ${sessionData.failures.length} |`);
+  lines.push(`| Learnings | ${sessionData.learnings.length} |`);
   lines.push("");
 
   // Key learnings
-  if (learnings.length > 0) {
+  if (sessionData.learnings.length > 0) {
     lines.push("## Key Learnings");
     lines.push("");
-    for (const learning of learnings) {
-      lines.push(learning);
+    for (const learning of sessionData.learnings) {
+      lines.push(`- ${learning}`);
     }
     lines.push("");
   }
@@ -214,7 +339,7 @@ function generateSummary(input: SummaryInput): string {
     lines.push("- Review failed attempts to avoid repeating mistakes");
     lines.push("- Consider breaking the task into smaller subtasks");
     lines.push("- Check if the original objective needs refinement");
-    if (failedCount > 3) {
+    if (sessionData.failures.length > 3) {
       lines.push("- Multiple failures suggest the approach may need rethinking");
     }
   } else if (outcome.label === "CANCELLED") {
@@ -228,18 +353,25 @@ function generateSummary(input: SummaryInput): string {
   lines.push("---");
   lines.push("");
   lines.push("_This summary was auto-generated by Ralph Wiggum._");
-  lines.push("_Review RALPH_MEMORY.md for full session history._");
+  lines.push("_Session data stored in Memorai for cross-session learning._");
   lines.push("");
 
   return lines.join("\n");
 }
 
 async function main() {
-  const memoryPath = process.argv[2] || DEFAULT_MEMORY_PATH;
-  const outputPath = process.argv[3] || DEFAULT_OUTPUT_PATH;
+  const outputPath = process.argv[2] || DEFAULT_OUTPUT_PATH;
 
-  // Try to read input from stdin (optional)
-  let input: SummaryInput = { memory_path: memoryPath };
+  // Check memorai availability
+  if (!databaseExists()) {
+    console.error("Error: Memorai database not found. Cannot generate summary.");
+    process.exit(1);
+  }
+
+  const client = new MemoraiClient();
+
+  // Read input from stdin
+  let input: SummaryInput = { session_id: "" };
 
   try {
     const chunks: Buffer[] = [];
@@ -262,11 +394,16 @@ async function main() {
       }
     }
   } catch {
-    // No stdin or invalid JSON - use defaults
+    // No stdin or invalid JSON
+  }
+
+  if (!input.session_id) {
+    console.error("Error: session_id is required in input JSON");
+    process.exit(1);
   }
 
   try {
-    const summary = generateSummary(input);
+    const summary = generateSummary(client, input);
     writeFileSync(outputPath, summary);
 
     console.log(
@@ -274,6 +411,8 @@ async function main() {
         path: outputPath,
         status: "generated",
         outcome: input.completion_reason || "unknown",
+        session_id: input.session_id,
+        storage: "memorai",
       })
     );
   } catch (error) {

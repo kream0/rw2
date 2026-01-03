@@ -15,7 +15,7 @@ The technique is named after Ralph Wiggum from The Simpsons, embodying the philo
 This version implements **deliberate malloc and context management** - the key insight from the original technique that was missing from earlier implementations:
 
 ### Context Management
-- **RALPH_MEMORY.md** - Persistent memory that survives /compact
+- **Memorai Integration** - All session memory stored in SQLite (cross-session learning)
 - **RALPH_STATUS.md** - Real-time dashboard for monitoring
 - **Goal recitation** - Each iteration receives formatted context with mission, status, and next actions
 
@@ -31,6 +31,13 @@ Automatic strategy switching based on iteration and error patterns:
 - Nudge system for one-time instructions
 - Desktop notifications (optional)
 - Status dashboard with error tracking
+
+### Memorai Integration (Required)
+Ralph v2 uses [Memorai](https://github.com/kream0/memorai) as its sole memory backend:
+- **Session persistence** - Objectives, state, progress, and learnings stored to SQLite
+- **Context injection** - Past learnings automatically included in context
+- **Cross-project search** - Query Ralph memories across all projects with `/ralph-recall --global`
+- **Date filtering** - Search by time range (e.g., `--since 7d`, `--until 2026-01-01`)
 
 ### Core Concept
 
@@ -104,15 +111,41 @@ Manage checkpoint pauses:
 - `status` - View checkpoint info
 - `continue` - Resume after checkpoint
 
+### /ralph-recall [mode] [OPTIONS]
+
+Query past Ralph sessions from Memorai.
+
+**Modes:**
+- `sessions` - Past session summaries (default)
+- `errors` - Error patterns learned
+- `learnings` - Key learnings
+- `stats` - Usage statistics
+- `<query>` - Custom search
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--global` | Search across all known projects |
+| `--since <date>` | Filter by date (e.g., "7d", "1w", "1m") |
+| `--until <date>` | Filter until date |
+| `--compact` | Compact output format |
+
+**Examples:**
+```bash
+/ralph-recall --global sessions        # All sessions across projects
+/ralph-recall errors --since 7d        # Recent errors
+/ralph-recall stats --global           # Global statistics
+```
+
 ## Context Files
 
 | File | Purpose |
 |------|---------|
-| `.claude/ralph-loop.local.md` | Active loop state |
-| `.claude/RALPH_MEMORY.md` | Persistent session memory |
+| `.claude/ralph-loop.local.md` | Active loop state (YAML frontmatter + prompt) |
 | `.claude/RALPH_STATUS.md` | Real-time dashboard |
-| `.claude/RALPH_NUDGE.md` | One-time instruction |
+| `.claude/RALPH_NUDGE.md` | One-time instruction (injected then deleted) |
 | `.claude/RALPH_SUMMARY.md` | Post-loop summary |
+| `.memorai/memory.db` | Session memory (SQLite via Memorai) |
 
 ## Technical Architecture
 
@@ -125,12 +158,14 @@ hooks/
   hooks.json            # Hook registrations
 
 scripts/
-  analyze-transcript.ts # Parse errors, progress, phases
+  analyze-transcript.ts # Parse errors, progress, phases (stores to memorai)
   strategy-engine.ts    # Determine adaptive strategy
-  update-memory.ts      # Update RALPH_MEMORY.md
-  update-status.ts      # Update RALPH_STATUS.md
-  build-context.ts      # Build enhanced prompt with goal recitation
-  generate-summary.ts   # Create post-loop analysis
+  update-memory.ts      # Store session state to memorai
+  update-status.ts      # Update RALPH_STATUS.md dashboard
+  build-context.ts      # Build prompt with goal recitation + memorai queries
+  generate-summary.ts   # Create post-loop analysis + store to memorai
+  ralph-recall.ts       # Query past sessions (global search, date filters)
+  run-headless.sh       # Headless/AFK operation wrapper
   types.ts              # TypeScript type definitions
 
 commands/
@@ -139,6 +174,7 @@ commands/
   ralph-status.md       # Status command
   ralph-nudge.md        # Nudge command
   ralph-checkpoint.md   # Checkpoint command
+  ralph-recall.md       # Query past sessions command
   help.md               # Help docs
 ```
 
@@ -218,9 +254,14 @@ Success depends on writing good prompts, not just having a good model.
 
 ## Requirements
 
-- Bun runtime (for TypeScript scripts)
-- jq (for JSON parsing in bash)
-- Claude Code with plugin support
+- **Bun runtime** (for TypeScript scripts)
+- **jq** (for JSON parsing in bash)
+- **Claude Code** with plugin support
+- **[Memorai](https://github.com/kream0/memorai)** (v1.0+) - Required for session memory
+  ```bash
+  bun add -g memorai
+  memorai init  # Run in project root before starting ralph-loop
+  ```
 
 ## Learn More
 

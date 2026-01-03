@@ -9,5 +9,8 @@
     "status": "bun run update-status.ts",
     "context": "bun run build-context.ts",
     "summary": "bun run generate-summary.ts"
+  },
+  "dependencies": {
+    "memorai": "file:../../../../memorai"
   }
 }

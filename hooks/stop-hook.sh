@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# Ralph Wiggum Stop Hook (Enhanced v2)
+# Ralph Wiggum Stop Hook (Memorai Edition)
 # Prevents session exit when a ralph-loop is active
-# Integrates TypeScript scripts for context management
+# All session memory stored in memorai
 
 set -euo pipefail
 
@@ -15,7 +15,6 @@ HOOK_INPUT=$(cat)
 
 # Paths
 RALPH_STATE_FILE=".claude/ralph-loop.local.md"
-RALPH_MEMORY_FILE=".claude/RALPH_MEMORY.md"
 RALPH_STATUS_FILE=".claude/RALPH_STATUS.md"
 RALPH_NUDGE_FILE=".claude/RALPH_NUDGE.md"
 
@@ -42,6 +41,7 @@ ITERATION=$(get_yaml_value "$FRONTMATTER" "iteration")
 MAX_ITERATIONS=$(get_yaml_value "$FRONTMATTER" "max_iterations")
 COMPLETION_PROMISE=$(get_yaml_value "$FRONTMATTER" "completion_promise")
 STARTED_AT=$(get_yaml_value "$FRONTMATTER" "started_at")
+SESSION_ID=$(get_yaml_value "$FRONTMATTER" "session_id")
 CHECKPOINT_INTERVAL=$(get_yaml_value "$FRONTMATTER" "checkpoint_interval")
 CHECKPOINT_MODE=$(get_yaml_value "$FRONTMATTER" "checkpoint_mode")
 CURRENT_STRATEGY=$(get_yaml_nested_value "$FRONTMATTER" "current")
@@ -65,8 +65,8 @@ if [[ $MAX_ITERATIONS -gt 0 ]] && [[ $ITERATION -ge $MAX_ITERATIONS ]]; then
   echo "🛑 Ralph loop: Max iterations ($MAX_ITERATIONS) reached."
 
   # Generate final summary
-  echo '{"completion_reason":"max_iterations","final_iteration":'$ITERATION'}' | \
-    bun run "${PLUGIN_ROOT}/scripts/generate-summary.ts" "$RALPH_MEMORY_FILE" ".claude/RALPH_SUMMARY.md" 2>/dev/null || true
+  echo "{\"session_id\":\"$SESSION_ID\",\"completion_reason\":\"max_iterations\",\"final_iteration\":$ITERATION}" | \
+    bun run "${PLUGIN_ROOT}/scripts/generate-summary.ts" ".claude/RALPH_SUMMARY.md" 2>/dev/null || true
 
   rm "$RALPH_STATE_FILE"
   exit 0
@@ -111,8 +111,8 @@ if [[ "$COMPLETION_PROMISE" != "null" ]] && [[ -n "$COMPLETION_PROMISE" ]]; then
     echo "✅ Ralph loop: Detected <promise>$COMPLETION_PROMISE</promise>"
 
     # Generate final summary
-    echo '{"completion_reason":"promise","final_iteration":'$ITERATION'}' | \
-      bun run "${PLUGIN_ROOT}/scripts/generate-summary.ts" "$RALPH_MEMORY_FILE" ".claude/RALPH_SUMMARY.md" 2>/dev/null || true
+    echo "{\"session_id\":\"$SESSION_ID\",\"completion_reason\":\"promise\",\"final_iteration\":$ITERATION}" | \
+      bun run "${PLUGIN_ROOT}/scripts/generate-summary.ts" ".claude/RALPH_SUMMARY.md" 2>/dev/null || true
 
     rm "$RALPH_STATE_FILE"
     exit 0
@@ -124,7 +124,7 @@ fi
 # 1. Analyze transcript
 ANALYSIS=$(bun run "${PLUGIN_ROOT}/scripts/analyze-transcript.ts" "$TRANSCRIPT_PATH" 2>/dev/null || echo '{"errors":[],"repeated_errors":[],"files_modified":[],"tests_run":false,"tests_passed":false,"tests_failed":false,"phase_completions":[],"meaningful_changes":false}')
 
-# 2. Build state JSON for scripts
+# 2. Build state JSON for scripts (now includes session_id)
 PROMPT_TEXT=$(awk '/^---$/{i++; next} i>=2' "$RALPH_STATE_FILE")
 
 STATE_JSON=$(jq -n \
@@ -133,6 +133,7 @@ STATE_JSON=$(jq -n \
   --argjson max_iterations "$MAX_ITERATIONS" \
   --arg completion_promise "$COMPLETION_PROMISE" \
   --arg started_at "${STARTED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
+  --arg session_id "${SESSION_ID:-}" \
   --argjson checkpoint_interval "${CHECKPOINT_INTERVAL:-0}" \
   --arg checkpoint_mode "${CHECKPOINT_MODE:-notify}" \
   --arg current_strategy "${CURRENT_STRATEGY:-explore}" \
@@ -144,6 +145,7 @@ STATE_JSON=$(jq -n \
     max_iterations: $max_iterations,
     completion_promise: $completion_promise,
     started_at: $started_at,
+    session_id: $session_id,
     checkpoint_interval: $checkpoint_interval,
     checkpoint_mode: $checkpoint_mode,
     strategy: {
@@ -169,13 +171,13 @@ STRATEGY=$(echo "$STRATEGY_INPUT" | bun run "${PLUGIN_ROOT}/scripts/strategy-eng
 
 NEW_STRATEGY=$(echo "$STRATEGY" | jq -r '.strategy')
 
-# 4. Update memory file
+# 4. Update memory in memorai
 MEMORY_INPUT=$(jq -n \
   --argjson state "$STATE_JSON" \
   --argjson analysis "$ANALYSIS" \
   '{state: $state, analysis: $analysis}')
 
-echo "$MEMORY_INPUT" | bun run "${PLUGIN_ROOT}/scripts/update-memory.ts" "$RALPH_MEMORY_FILE" 2>/dev/null || true
+echo "$MEMORY_INPUT" | bun run "${PLUGIN_ROOT}/scripts/update-memory.ts" 2>/dev/null || true
 
 # 5. Update status dashboard
 STATUS_INPUT=$(jq -n \
@@ -203,18 +205,16 @@ if [[ "${CHECKPOINT_INTERVAL:-0}" -gt 0 ]]; then
   fi
 fi
 
-# 8. Build enhanced context
+# 8. Build enhanced context (session_id passed in state)
 CONTEXT_INPUT=$(jq -n \
   --argjson state "$STATE_JSON" \
   --argjson strategy "$STRATEGY" \
   --argjson analysis "$ANALYSIS" \
-  --arg memory_path "$RALPH_MEMORY_FILE" \
   --arg nudge_content "$NUDGE_CONTENT" \
   '{
     state: $state,
     strategy: $strategy,
     analysis: $analysis,
-    memory_path: $memory_path,
     nudge_content: $nudge_content
   }')
 
@@ -238,7 +238,7 @@ Ralph has paused for your review.
 ## How to Continue
 
 1. Review the status: \`cat .claude/RALPH_STATUS.md\`
-2. Review the memory: \`cat .claude/RALPH_MEMORY.md\`
+2. Query past sessions: \`/ralph-recall <query>\`
 3. Optionally send guidance: \`/ralph-nudge "your instruction"\`
 4. Resume: \`/ralph-checkpoint continue\`
 

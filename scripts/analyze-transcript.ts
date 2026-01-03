@@ -17,6 +17,7 @@
 import { readFileSync } from "fs";
 import type { TranscriptAnalysis, ErrorEntry, RepeatedError } from "./types";
 import { ERROR_PATTERNS } from "./types";
+import { MemoraiClient, search, storeMemory, databaseExists } from "memorai";
 
 // Phase completion markers
 const PHASE_PATTERNS = [
@@ -208,12 +209,93 @@ function detectMeaningfulChanges(
   return filesModified.length > 0 || testsRun || phaseCompletions.length > 0;
 }
 
+/**
+ * Phase 2: Store significant error patterns to memorai for cross-session learning.
+ * Only stores repeated errors (3+) which indicate patterns worth remembering.
+ * Silently fails if memorai is not available.
+ */
+function storeErrorPatternsToMemorai(
+  repeatedErrors: RepeatedError[],
+  errors: ErrorEntry[],
+  sessionId?: string
+): void {
+  try {
+    if (!databaseExists()) {
+      return;
+    }
+
+    // Only store if there are repeated errors (3+ occurrences)
+    const significantErrors = repeatedErrors.filter((e) => e.count >= 3);
+    if (significantErrors.length === 0) {
+      return;
+    }
+
+    const client = new MemoraiClient();
+
+    for (const repeatedError of significantErrors) {
+      // Get sample from the errors
+      const sample = errors.find((e) => e.pattern === repeatedError.pattern);
+
+      // Check if this error pattern was recently stored (avoid duplicates)
+      const existing = client.search({
+        query: repeatedError.pattern,
+        tags: ["ralph", "error-pattern"],
+        limit: 1,
+      });
+
+      // Only store if not recently stored or low relevance match
+      if (existing.length === 0 || existing[0].relevance < 80) {
+        client.store({
+          category: "reports",
+          title: `Repeated Error: ${repeatedError.pattern}`,
+          content: `Error pattern occurred ${repeatedError.count} times in a single iteration.\n\nType: ${repeatedError.pattern}\nSample: ${sample?.sample || "N/A"}\n\nThis is a significant blocker that required recovery mode.`,
+          tags: [
+            "ralph",
+            "error-pattern",
+            repeatedError.pattern.toLowerCase().replace(/\s+/g, "-"),
+          ],
+          importance: repeatedError.count >= 5 ? 9 : 7, // Higher importance for very frequent errors
+          sessionId,
+        });
+      }
+    }
+  } catch {
+    // Silently fail - memorai integration is optional
+  }
+}
+
 async function main() {
   const transcriptPath = process.argv[2];
 
   if (!transcriptPath) {
     console.error("Usage: bun run analyze-transcript.ts <transcript_path>");
     process.exit(1);
+  }
+
+  // Try to read optional state from stdin (for sessionId)
+  let sessionId: string | undefined;
+  try {
+    const chunks: Buffer[] = [];
+    const hasStdin = await Promise.race([
+      (async () => {
+        for await (const chunk of Bun.stdin.stream()) {
+          chunks.push(chunk);
+          return true;
+        }
+        return chunks.length > 0;
+      })(),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 50)),
+    ]);
+
+    if (hasStdin && chunks.length > 0) {
+      const inputText = Buffer.concat(chunks).toString("utf-8").trim();
+      if (inputText) {
+        const state = JSON.parse(inputText);
+        sessionId = state.session_id || state.sessionId;
+      }
+    }
+  } catch {
+    // No stdin or invalid JSON - continue without sessionId
   }
 
   try {
@@ -229,6 +311,9 @@ async function main() {
       testStatus.tests_run,
       phase_completions
     );
+
+    // Phase 2: Store significant error patterns to memorai
+    storeErrorPatternsToMemorai(repeated_errors, errors, sessionId);
 
     const analysis: TranscriptAnalysis = {
       errors,

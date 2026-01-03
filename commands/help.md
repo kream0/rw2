@@ -147,6 +147,41 @@ Manage checkpoint pauses.
 
 ---
 
+### /ralph-recall [mode|query] [OPTIONS]
+
+Query past Ralph sessions from memorai.
+
+**Usage:**
+```
+/ralph-recall              # Recent sessions
+/ralph-recall sessions     # Past session summaries
+/ralph-recall errors       # Error patterns learned
+/ralph-recall learnings    # Key learnings
+/ralph-recall stats        # Usage statistics
+/ralph-recall typescript   # Search for specific memories
+```
+
+**Options:**
+```
+--global                   # Search all known projects
+--since 7d                 # Filter by date (7d, 1w, 1m, 1y)
+--until 2026-01-01         # Filter until date
+--compact                  # Compact output format
+```
+
+**Examples:**
+```
+/ralph-recall --global sessions          # All sessions across projects
+/ralph-recall errors --since 7d          # Recent errors
+/ralph-recall stats --global             # Global statistics
+```
+
+Searches memorai for Ralph-related memories including session summaries, error patterns, and key learnings from past runs.
+
+**Requires:** Memorai database (`memorai init`) or `--global` flag
+
+---
+
 ## Key Concepts
 
 ### Completion Promises
